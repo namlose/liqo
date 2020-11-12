@@ -12,14 +12,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-package liqonetOperators
+package tunnel_operator
 
 import (
 	"context"
 	netv1alpha1 "github.com/liqotech/liqo/apis/net/v1alpha1"
 	liqonetOperator "github.com/liqotech/liqo/pkg/liqonet"
-	"github.com/vishvananda/netlink"
+	"github.com/liqotech/liqo/pkg/liqonet/tunnel"
+	_ "github.com/liqotech/liqo/pkg/liqonet/tunnel/wireguard"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8s "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog"
@@ -29,27 +31,38 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"syscall"
 	"time"
+)
+
+var (
+	shutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGKILL}
 )
 
 // TunnelController reconciles a TunnelEndpoint object
 type TunnelController struct {
 	client.Client
+	tunnel.Driver
+	namespace                    string
+	drivers                      map[string]tunnel.Driver
 	Scheme                       *runtime.Scheme
 	Recorder                     record.EventRecorder
+	K8sClient                    *k8s.Clientset
 	TunnelIFacesPerRemoteCluster map[string]int
 	RetryTimeout                 time.Duration
+	IPTHandler *liqonetOperator.IPTablesHandler
+	liqonetOperator.RouteManager
 }
 
 // +kubebuilder:rbac:groups=net.liqo.io,resources=tunnelendpoints,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=net.liqo.io,resources=tunnelendpoints/status,verbs=get;update;patch
 
-func (r *TunnelController) Reconcile(req ctrl.Request) (ctrl.Result, error) {
+func (tc *TunnelController) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	ctx := context.Background()
 	var endpoint netv1alpha1.TunnelEndpoint
 	//name of our finalizer
 	tunnelEndpointFinalizer := "tunnelEndpointFinalizer.net.liqo.io"
-	if err := r.Get(ctx, req.NamespacedName, &endpoint); err != nil {
+	if err := tc.Get(ctx, req.NamespacedName, &endpoint); err != nil {
 		klog.Errorf("unable to fetch resource %s: %s", req.Name, err)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -57,7 +70,7 @@ func (r *TunnelController) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 	//then the status field. so we wait for the status to be ready.
 	if endpoint.Status.Phase != "Ready" {
 		klog.Infof("%s -> resource %s is not ready", endpoint.Spec.ClusterID, endpoint.Name)
-		return ctrl.Result{RequeueAfter: r.RetryTimeout}, nil
+		return ctrl.Result{RequeueAfter: tc.RetryTimeout}, nil
 	}
 	// examine DeletionTimestamp to determine if object is under deletion
 	if endpoint.ObjectMeta.DeletionTimestamp.IsZero() {
@@ -66,103 +79,97 @@ func (r *TunnelController) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			// then lets add the finalizer and update the object. This is equivalent
 			// registering our finalizer.
 			endpoint.ObjectMeta.Finalizers = append(endpoint.Finalizers, tunnelEndpointFinalizer)
-			if err := r.Update(ctx, &endpoint); err != nil {
+			if err := tc.Update(ctx, &endpoint); err != nil {
 				klog.Errorf("%s -> unable to update resource %s: %s", endpoint.Spec.ClusterID, endpoint.Name, err)
-				return ctrl.Result{RequeueAfter: r.RetryTimeout}, err
+				return ctrl.Result{RequeueAfter: tc.RetryTimeout}, err
 			}
 		}
 	} else {
 		//the object is being deleted
 		if liqonetOperator.ContainsString(endpoint.Finalizers, tunnelEndpointFinalizer) {
-			if err := liqonetOperator.RemoveGreTunnel(&endpoint); err != nil {
+			if err := tc.drivers[endpoint.Spec.BackendType].DisconnectFromEndpoint(&endpoint); err != nil {
 				//record an event and return
-				r.Recorder.Event(&endpoint, "Warning", "Processing", err.Error())
+				tc.Recorder.Event(&endpoint, "Warning", "Processing", err.Error())
 				klog.Errorf("%s -> unable to remove tunnel network interface %s for resource %s: %s", endpoint.Spec.ClusterID, endpoint.Status.TunnelIFaceName, endpoint.Name, err)
 				return ctrl.Result{}, err
 			}
-			r.Recorder.Event(&endpoint, "Normal", "Processing", "tunnel network interface removed")
+			tc.Recorder.Event(&endpoint, "Normal", "Processing", "tunnel network interface removed")
 			//safe to do, even if the key does not exist in the map
-			delete(r.TunnelIFacesPerRemoteCluster, endpoint.Spec.ClusterID)
+			delete(tc.TunnelIFacesPerRemoteCluster, endpoint.Spec.ClusterID)
 			klog.Infof("%s -> tunnel network interface %s removed for resource %s", endpoint.Spec.ClusterID, endpoint.Status.TunnelIFaceName, endpoint.Name)
 			retryError := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				if err := r.Get(ctx, req.NamespacedName, &endpoint); err != nil {
+				if err := tc.Get(ctx, req.NamespacedName, &endpoint); err != nil {
 					klog.Errorf("unable to fetch resource %s: %s", req.Name, err)
 					return err
 				}
 				//remove the finalizer from the list and update it.
 				endpoint.Finalizers = liqonetOperator.RemoveString(endpoint.Finalizers, tunnelEndpointFinalizer)
-				if err := r.Update(ctx, &endpoint); err != nil {
+				if err := tc.Update(ctx, &endpoint); err != nil {
 					return err
 				}
 				return nil
 			})
 			if retryError != nil {
 				klog.Errorf("%s -> unable to update finalizers of resource %s: %s", endpoint.Spec.ClusterID, endpoint.Name, retryError)
-				return ctrl.Result{RequeueAfter: r.RetryTimeout}, retryError
+				return ctrl.Result{RequeueAfter: tc.RetryTimeout}, retryError
 			}
-			return ctrl.Result{RequeueAfter: r.RetryTimeout}, nil
+			return ctrl.Result{RequeueAfter: tc.RetryTimeout}, nil
 		}
 	}
 	//try to install the GRE tunnel if it does not exist
-	iFaceIndex, iFaceName, err := liqonetOperator.InstallGreTunnel(&endpoint)
+	con, err := tc.drivers[endpoint.Spec.BackendType].ConnectToEndpoint(&endpoint)
 	if err != nil {
 		klog.Errorf("%s -> unable to create tunnel network interface for resource %s :%s", endpoint.Spec.ClusterID, endpoint.Name, err)
-		r.Recorder.Event(&endpoint, "Warning", "Processing", err.Error())
-		return ctrl.Result{RequeueAfter: r.RetryTimeout}, err
+		tc.Recorder.Event(&endpoint, "Warning", "Processing", err.Error())
+		return ctrl.Result{RequeueAfter: tc.RetryTimeout}, err
 	}
-	r.Recorder.Event(&endpoint, "Normal", "Processing", "tunnel network interface installed")
-	klog.Infof("%s -> tunnel network interface with name %s for resource %s created successfully", endpoint.Spec.ClusterID, iFaceName, endpoint.Name)
+	tc.Recorder.Event(&endpoint, "Normal", "Processing", "tunnel network interface installed")
+	//klog.Infof("%s -> tunnel network interface with name %s for resource %s created successfully", endpoint.Spec.ClusterID, iFaceName, endpoint.Name)
 	//save the IFace index in the map
-	r.TunnelIFacesPerRemoteCluster[endpoint.Spec.ClusterID] = iFaceIndex
 	//update the status of CR if needed
 	//here we recover from conflicting resource versions
+	if err := tc.EnsureIPTablesRulesPerCluster(&endpoint); err != nil{
+		klog.Errorf("%s -> unable to iptables rules for resoure %s: %v", endpoint.Spec.ClusterID, endpoint.Namespace, err)
+		return ctrl.Result{RequeueAfter: tc.RetryTimeout}, err
+	}
+	if err := tc.EnsureRoutesPerCluster("liqo-wg", &endpoint); err != nil{
+		klog.Errorf("%s -> unable to insert route: %v", endpoint.Spec.ClusterID, err)
+	}
 	retryError := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		toBeUpdated := false
-		if err := r.Get(ctx, req.NamespacedName, &endpoint); err != nil {
-			klog.Errorf("unable to fetch resource %s: %s", req.Name, err)
+		if con == nil {
+			return nil
+		}
+		if err := tc.Get(ctx, req.NamespacedName, &endpoint); err != nil {
 			return err
 		}
-		if endpoint.Status.TunnelIFaceName != iFaceName {
-			endpoint.Status.TunnelIFaceName = iFaceName
-			toBeUpdated = true
-		}
-		if endpoint.Status.TunnelIFaceIndex != iFaceIndex {
-			endpoint.Status.TunnelIFaceIndex = iFaceIndex
-			toBeUpdated = true
-		}
-		if toBeUpdated {
-			err = r.Status().Update(context.Background(), &endpoint)
-			return err
-		}
-		return nil
+		endpoint.Status.Connection = *con
+		err = tc.Status().Update(context.Background(), &endpoint)
+		return err
 	})
 	if retryError != nil {
 		klog.Errorf("%s -> unable to update status of resource %s: %s", endpoint.Spec.ClusterID, endpoint.Name, retryError)
-		return ctrl.Result{RequeueAfter: r.RetryTimeout}, retryError
+		return ctrl.Result{RequeueAfter: tc.RetryTimeout}, retryError
 	}
-	return ctrl.Result{RequeueAfter: r.RetryTimeout}, nil
+	return ctrl.Result{RequeueAfter: tc.RetryTimeout}, nil
 }
 
 //used to remove all the tunnel interfaces when the controller is closed
 //it does not return an error, but just logs them, cause we can not recover from
 //them at exit time
-func (r *TunnelController) RemoveAllTunnels() {
-	for clusterID, ifaceIndex := range r.TunnelIFacesPerRemoteCluster {
-		existingIface, err := netlink.LinkByIndex(ifaceIndex)
+func (tc *TunnelController) RemoveAllTunnels() {
+	for driverType, driver := range tc.drivers {
+		err := driver.Close()
 		if err == nil {
-			//Remove the existing gre interface
-			if err = netlink.LinkDel(existingIface); err != nil {
-				klog.Errorf("%s -> unable to delete tunnel network interface with name %s: %s", clusterID, existingIface.Attrs().Name, err)
-			}
+			klog.Infof("removed tunnel interface of type %s", driverType)
 		} else {
-			klog.Errorf("%s -> unable to fetch tunnel network interface with index %d: %s", clusterID, ifaceIndex, err)
+			klog.Errorf("unable to delete tunnel network interface of type %s: %s", driverType, err)
 		}
 	}
 }
 
 // SetupSignalHandlerForRouteOperator registers for SIGTERM, SIGINT, SIGKILL. A stop channel is returned
 // which is closed on one of these signals.
-func (r *TunnelController) SetupSignalHandlerForTunnelOperator() (stopCh <-chan struct{}) {
+func (tc *TunnelController) SetupSignalHandlerForTunnelOperator() (stopCh <-chan struct{}) {
 	stop := make(chan struct{})
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, shutdownSignals...)
@@ -172,11 +179,11 @@ func (r *TunnelController) SetupSignalHandlerForTunnelOperator() (stopCh <-chan 
 		r.RemoveAllTunnels()
 		<-c
 		close(stop)
-	}(r)
+	}(tc)
 	return stop
 }
 
-func (r *TunnelController) SetupWithManager(mgr ctrl.Manager) error {
+func (tc *TunnelController) SetupWithManager(mgr ctrl.Manager) error {
 	resourceToBeProccesedPredicate := predicate.Funcs{
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			//finalizers are used to check if a resource is being deleted, and perform there the needed actions
@@ -186,5 +193,83 @@ func (r *TunnelController) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&netv1alpha1.TunnelEndpoint{}).WithEventFilter(resourceToBeProccesedPredicate).
-		Complete(r)
+		Complete(tc)
 }
+
+//for each registered tunnel implementation it creates and initializes the driver
+func (tc *TunnelController) SetUpTunnelDrivers() error {
+	tc.drivers = make(map[string]tunnel.Driver)
+	for tunnelType, createDriverFunc := range tunnel.Drivers {
+		klog.V(3).Infof("Creating driver for tunnel of type %s", tunnelType)
+		d, err := createDriverFunc(tc.K8sClient, tc.namespace)
+		if err != nil {
+			return err
+		}
+		klog.V(3).Infof("Initializing driver for %s tunnel", tunnelType)
+		err = d.Init()
+		if err != nil {
+			return err
+		}
+		klog.V(3).Infof("Driver for %s tunnel created and initialized", tunnelType)
+		tc.drivers[tunnelType] = d
+	}
+	return nil
+}
+
+func (tc *TunnelController) SetUpIPTablesHandler() error{
+	iptHandler, err := liqonetOperator.NewIPTablesHandler()
+	if err != nil{
+		return err
+	}
+	tc.IPTHandler = iptHandler
+	return nil
+}
+
+func (tc *TunnelController) SetUpRouteManager () {
+	tc.RouteManager = liqonetOperator.RouteManager{}
+}
+
+//Instantiates and initializes the tunnel controller
+func NewTunnelController(mgr ctrl.Manager, namespace string) (*TunnelController, error) {
+	clientset, err := k8s.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		return nil, err
+	}
+	tc := &TunnelController{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorderFor("tunnel-operator"),
+		K8sClient: clientset,
+		namespace: namespace,
+	}
+	err = tc.SetUpTunnelDrivers()
+	if err != nil {
+		return nil, err
+	}
+	err = tc.SetUpIPTablesHandler()
+	if err != nil {
+		return nil, err
+	}
+	tc.SetUpRouteManager()
+	return tc, nil
+}
+
+func (tc *TunnelController) EnsureIPTablesRulesPerCluster(tep *netv1alpha1.TunnelEndpoint) error {
+	if err := tc.IPTHandler.EnsureChainRulespecs(tep); err != nil {
+		return err
+	}
+	if err := tc.IPTHandler.EnsurePostroutingRules(true, tep); err != nil {
+			return err
+		}
+		if err := tc.IPTHandler.EnsurePreroutingRules(tep); err != nil {
+			return err
+		}
+		/*if err := r.ensureForwardRules(tep); err != nil {
+			return err
+		}
+		if err := r.ensureInputRules(tep); err != nil {
+			return err
+		}*/
+	return nil
+}
+

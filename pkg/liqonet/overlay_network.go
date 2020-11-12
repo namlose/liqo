@@ -18,20 +18,17 @@ const (
 )
 
 type VxlanNetConfig struct {
-	Network    string `json:"Network"`
-	DeviceName string `json:"DeviceName"`
-	Port       string `json:"Port"`
-	Vni        string `json:"Vni"`
+	NetworkPrefix string `json:"NetworkPrefix"`
+	DeviceName    string `json:"DeviceName"`
+	Port          string `json:"Port"`
+	Vni           string `json:"Vni"`
 }
 
-func CreateVxLANInterface(clientset *kubernetes.Clientset, vxlanConfig VxlanNetConfig) error {
+func CreateVxLANInterface(clientset *kubernetes.Clientset, vxlanConfig VxlanNetConfig, isGateway bool) error {
 	podIPAddr, err := getPodIP()
 	if err != nil {
 		return err
 	}
-	token := strings.Split(vxlanConfig.Network, "/")
-	vxlanNet := token[0]
-
 	//get the mtu of the default interface
 	mtu, err := getDefaultIfaceMTU()
 	if err != nil {
@@ -42,8 +39,7 @@ func CreateVxLANInterface(clientset *kubernetes.Clientset, vxlanConfig VxlanNetC
 	//take the last octet of the podIP
 	//TODO: use & and | operators with masks
 	temp := strings.Split(podIPAddr.String(), ".")
-	temp1 := strings.Split(vxlanNet, ".")
-	vxlanIPString := temp1[0] + "." + temp1[1] + "." + temp1[2] + "." + temp[3]
+	vxlanIPString := vxlanConfig.NetworkPrefix + "." + temp[1] + "." + temp[2] + "." + temp[3]
 	vxlanIP := net.ParseIP(vxlanIPString)
 
 	vxlanMTU := mtu - vxlanOverhead
@@ -66,11 +62,11 @@ func CreateVxLANInterface(clientset *kubernetes.Clientset, vxlanConfig VxlanNetC
 	if err != nil {
 		return fmt.Errorf("failed to create vxlan interface on node with ip -> %s: %v", podIPAddr.String(), err)
 	}
-	err = vxlanDev.ConfigureIPAddress(vxlanIP, net.IPv4Mask(255, 255, 255, 0))
+	err = vxlanDev.ConfigureIPAddress(vxlanIP, net.IPv4Mask(240, 0, 0, 0))
 	if err != nil {
 		return fmt.Errorf("failed to configure ip in vxlan interface on node with ip -> %s: %v", podIPAddr.String(), err)
 	}
-
+	if isGateway{
 	remoteVETPs, err := getRemoteVTEPS(clientset)
 	if err != nil {
 		return err
@@ -89,6 +85,7 @@ func CreateVxLANInterface(clientset *kubernetes.Clientset, vxlanConfig VxlanNetC
 		if err != nil {
 			return fmt.Errorf("an error occured while adding an fdb entry : %v", err)
 		}
+	}
 	}
 	return nil
 }
@@ -150,7 +147,7 @@ func ReadVxlanNetConfig(defaultConfig VxlanNetConfig) (VxlanNetConfig, error) {
 		if err != nil {
 			return config, fmt.Errorf("an error occured while unmarshalling \"%s\" configuration file: %v", pathToConfigFile, err)
 		}
-		if config.Network == "" || config.Port == "" || config.DeviceName == "" || config.Vni == "" {
+		if config.NetworkPrefix == "" || config.Port == "" || config.DeviceName == "" || config.Vni == "" {
 			return config, errors.New("some configuration fields are missing in \"" + pathToConfigFile + "\", please check your configuration.")
 		}
 		return config, nil

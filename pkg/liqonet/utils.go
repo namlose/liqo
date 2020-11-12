@@ -14,11 +14,16 @@ import (
 	"net"
 	"os"
 	"strings"
+	"syscall"
 )
 
 const (
 	RouteOpLabelKey = "rouOp"
 	TunOpLabelKey   = "tunOp"
+)
+
+var (
+	ShutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGKILL}
 )
 
 func getPodIP() (net.IP, error) {
@@ -30,6 +35,14 @@ func getPodIP() (net.IP, error) {
 		return nil, errors.New("pod IP is not yet set")
 	}
 	return net.ParseIP(ipAddress), nil
+}
+
+func GetPodNamespace() (string, error) {
+	namespace, isSet := os.LookupEnv("POD_NAMESPACE")
+	if !isSet {
+		return "", errdefs.NotFound("the pod namespace is not set as an environment variable")
+	}
+	return namespace, nil
 }
 
 func GetNodeName() (string, error) {
@@ -48,7 +61,7 @@ func GetClusterPodCIDR() (string, error) {
 	return podCIDR, nil
 }
 
-func getInternalIPOfNode(node corev1.Node) (string, error) {
+func GetInternalIPOfNode(node *corev1.Node) (string, error) {
 	var internalIp string
 	for _, address := range node.Status.Addresses {
 		if address.Type == "InternalIP" {
@@ -80,7 +93,7 @@ func IsGatewayNode(clientset *kubernetes.Clientset) (bool, error) {
 	if err != nil {
 		return isGatewayNode, err
 	}
-	internalIP, err := getInternalIPOfNode(nodesList.Items[0])
+	internalIP, err := GetInternalIPOfNode(&nodesList.Items[0])
 	if err != nil {
 		return isGatewayNode, fmt.Errorf("unable to get internal ip of the gateway node: %v", err)
 	}
@@ -103,11 +116,11 @@ func GetGatewayVxlanIP(clientset *kubernetes.Clientset, vxlanConfig VxlanNetConf
 		klog.V(4).Infof("number of gateway nodes found: %d", len(nodesList.Items))
 		return gatewayVxlanIP, errdefs.NotFound("no gateway node has been found")
 	}
-	internalIP, err := getInternalIPOfNode(nodesList.Items[0])
+	internalIP, err := GetInternalIPOfNode(&nodesList.Items[0])
 	if err != nil {
 		return gatewayVxlanIP, fmt.Errorf("unable to get internal ip of the gateway node: %v", err)
 	}
-	token := strings.Split(vxlanConfig.Network, "/")
+	token := strings.Split(vxlanConfig.NetworkPrefix, "/")
 	vxlanNet := token[0]
 	//derive IP for the vxlan device
 	//take the last octet of the podIP
@@ -131,7 +144,7 @@ func getRemoteVTEPS(clientset *kubernetes.Clientset) ([]string, error) {
 	}
 	//populate the VTEPs
 	for _, node := range nodesList.Items {
-		internalIP, err := getInternalIPOfNode(node)
+		internalIP, err := GetInternalIPOfNode(&node)
 		if err != nil {
 			//Log the error but don't exit
 			logger.Error(err, "unable to get internal ip of the node named -> %s", node.Name)

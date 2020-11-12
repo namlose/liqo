@@ -41,6 +41,14 @@ import (
 
 var (
 	shutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGKILL}
+
+	ResyncPeriod = 30 * time.Second
+
+	result = ctrl.Result{
+		Requeue:      false,
+		RequeueAfter: 5 * time.Second,
+	}
+	defaultPodCIDRValue = "None"
 )
 
 const (

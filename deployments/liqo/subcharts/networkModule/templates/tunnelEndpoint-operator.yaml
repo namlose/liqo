@@ -33,9 +33,15 @@ rules:
       - ""
     resources:
       - events
+      - secrets
     verbs:
       - create
+      - delete
+      - get
+      - list
       - patch
+      - update
+      - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -66,6 +72,7 @@ spec:
     metadata:
       labels:
         run: tunnel-operator
+        net.liqo.io/gatewayPod: "true"
     spec:
       nodeSelector: 
         net.liqo.io/gateway: "true"
@@ -74,6 +81,8 @@ spec:
         - image: {{ .Values.tunnelEndpointOperator.image.repository }}{{ .Values.global.suffix | default .Values.suffix }}:{{ .Values.global.version | default .Values.version }}
           imagePullPolicy: {{ .Values.tunnelEndpointOperator.image.pullPolicy }}
           name: tunnel-operator
+          ports:
+          - containerPort: 5871
           command: ["/usr/bin/liqonet"]
           resources:
             limits:
@@ -97,5 +106,21 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-      hostNetwork: true
+      hostNetwork: false
       restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wireguard-endpoint
+  labels:
+    net.liqo.io/tunnelEndpoint: "true"
+spec:
+  type: NodePort
+  ports:
+    - name: wireguard
+      port: 5871
+      targetPort: 5871
+      protocol: UDP
+  selector:
+    net.liqo.io/gatewayPod: "true"
