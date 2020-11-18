@@ -3,6 +3,8 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"github.com/liqotech/liqo/pkg/virtualKubelet"
 	"github.com/liqotech/liqo/test/e2e/util"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
@@ -83,16 +85,18 @@ func ConnectivityCheckPodToPodCluster1ToCluster2(con *util.Tester, t *testing.T)
 		klog.Error(err)
 		t.Fail()
 	}
-	if !util.WaitForPodToBeReady(con.Client1, waitTime, con.ClusterID1, podLocal.Namespace, podLocal.Name) {
+	if !util.WaitForPodToBeReady("home", con.Client1, waitTime, con.ClusterID1, podLocal.Namespace, podLocal.Name) {
 		t.Fail()
 	}
-	if !util.WaitForPodToBeReady(con.Client1, waitTime, con.ClusterID1, podRemote.Namespace, podRemote.Name) {
+	if !util.WaitForPodToBeReady("home", con.Client1, waitTime, con.ClusterID1, podRemote.Namespace, podRemote.Name) {
 		t.Fail()
 	}
-	if !util.WaitForPodToBeReady(con.Client2, waitTime, con.ClusterID2, reflectedNamespace, podRemote.Name) {
+	if !util.WaitForPodToBeReady("foreign", con.Client2, waitTime, con.ClusterID2, reflectedNamespace, podRemote.Name) {
 		t.Fail()
 	}
-	podRemoteUpdateCluster2, err := con.Client2.CoreV1().Pods(reflectedNamespace).Get(context.TODO(), podRemote.Name, metav1.GetOptions{})
+	podRemoteUpdateCluster2, err := con.Client2.CoreV1().Pods(reflectedNamespace).List(context.TODO(), metav1.ListOptions{
+		LabelSelector:  fmt.Sprintf("%s=%s", virtualKubelet.ReflectedpodKey, podRemote.Name),
+	})
 	if err != nil {
 		klog.Error(err)
 		t.Fail()
@@ -107,7 +111,7 @@ func ConnectivityCheckPodToPodCluster1ToCluster2(con *util.Tester, t *testing.T)
 		klog.Error(err)
 		t.Fail()
 	}
-	assert.True(t, isContained(remoteNodes, podRemoteUpdateCluster2.Spec.NodeName), "remotepod should be running on one of the local nodes")
+	assert.True(t, isContained(remoteNodes, podRemoteUpdateCluster2.Items[0].Spec.NodeName), "remotepod should be running on one of the local nodes")
 	assert.True(t, isContained(localNodes, podLocalUpdate.Spec.NodeName), "localpod should be running on one of the remote pods")
 	cmd := command + podRemoteUpdateCluster1.Status.PodIP
 	stdout, _, err := util.ExecCmd(con.Config1, con.Client1, podLocalUpdate.Name, podLocalUpdate.Namespace, cmd)
@@ -147,13 +151,13 @@ func ConnectivityCheckPodToPodCluster2ToCluster1(con *util.Tester, t *testing.T)
 		klog.Error(err)
 		t.Fail()
 	}
-	if !util.WaitForPodToBeReady(con.Client2, waitTime, con.ClusterID2, podLocal.Namespace, podLocal.Name) {
+	if !util.WaitForPodToBeReady("foreign", con.Client2, waitTime, con.ClusterID2, podLocal.Namespace, podLocal.Name) {
 		t.Fail()
 	}
-	if !util.WaitForPodToBeReady(con.Client2, waitTime, con.ClusterID2, podRemote.Namespace, podRemote.Name) {
+	if !util.WaitForPodToBeReady("foreign", con.Client2, waitTime, con.ClusterID2, podRemote.Namespace, podRemote.Name) {
 		t.Fail()
 	}
-	if !util.WaitForPodToBeReady(con.Client1, waitTime, con.ClusterID1, reflectedNamespace, podRemote.Name) {
+	if !util.WaitForPodToBeReady("home", con.Client1, waitTime, con.ClusterID1, reflectedNamespace, podRemote.Name) {
 		t.Fail()
 	}
 	podRemoteUpdateCluster1, err := con.Client1.CoreV1().Pods(reflectedNamespace).Get(context.TODO(), podRemote.Name, metav1.GetOptions{})
