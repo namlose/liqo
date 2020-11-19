@@ -2,10 +2,12 @@ package discovery
 
 import (
 	"errors"
+	"fmt"
 	"github.com/grandcat/zeroconf"
 	"k8s.io/klog"
 	"net"
 	"sync"
+	"time"
 )
 
 type AuthData struct {
@@ -14,18 +16,25 @@ type AuthData struct {
 }
 
 func (authData *AuthData) Get(discovery *DiscoveryCtrl, entry *zeroconf.ServiceEntry) error {
-	return authData.Decode(entry)
+	if discovery.isForeign(entry.AddrIPv4) {
+		return authData.Decode(entry, discovery.dialTcpTimeout)
+	}
+	return nil
 }
 
-func (authData *AuthData) Decode(entry *zeroconf.ServiceEntry) error {
+func (authData *AuthData) IsComplete() bool {
+	return authData.address != "" && authData.port > 0
+}
+
+func (authData *AuthData) Decode(entry *zeroconf.ServiceEntry, timeout time.Duration) error {
 	authData.port = entry.Port
 
-	ip, err := getReachable(entry.AddrIPv4, entry.Port)
+	ip, err := getReachable(entry.AddrIPv4, entry.Port, timeout)
 	if err != nil {
-		ip, err = getReachable(entry.AddrIPv6, entry.Port)
+		ip, err = getReachable(entry.AddrIPv6, entry.Port, timeout)
 	}
 	if err != nil {
-		klog.Error(err)
+		klog.Errorf("%v %v %v", err, entry.AddrIPv4, entry.Port)
 		return err
 	}
 
@@ -33,7 +42,7 @@ func (authData *AuthData) Decode(entry *zeroconf.ServiceEntry) error {
 	return nil
 }
 
-func getReachable(ips []net.IP, port int) (*net.IP, error) {
+func getReachable(ips []net.IP, port int, timeout time.Duration) (*net.IP, error) {
 	resChan := make(chan int, len(ips))
 	defer close(resChan)
 	wg := sync.WaitGroup{}
@@ -42,7 +51,7 @@ func getReachable(ips []net.IP, port int) (*net.IP, error) {
 	// search in an async way for all reachable ips
 	for i, ip := range ips {
 		go func(ip net.IP, port int, index int, ch chan int) {
-			if !ip.IsLoopback() && !ip.IsMulticast() && isReachable(ip.String(), port) {
+			if !ip.IsLoopback() && !ip.IsMulticast() && isReachable(ip.String(), port, timeout) {
 				ch <- index
 			}
 			wg.Done()
@@ -59,9 +68,8 @@ func getReachable(ips []net.IP, port int) (*net.IP, error) {
 	}
 }
 
-func isReachable(address string, port int) bool {
-	//_, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", address, port), 500*time.Millisecond)
-	//return err == nil
-	// TODO: no service is available yet
-	return true
+func isReachable(address string, port int, timeout time.Duration) bool {
+	_, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", address, port), timeout)
+	klog.V(4).Infof("%s:%d %v", address, port, err)
+	return err == nil
 }

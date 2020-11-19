@@ -53,6 +53,12 @@ func (discoveryCache *discoveryCache) add(key string, data DiscoverableData) {
 	}
 }
 
+func (discoveryCache *discoveryCache) delete(key string) {
+	discoveryCache.lock.Lock()
+	defer discoveryCache.lock.Unlock()
+	delete(discoveryCache.discoveredServices, key)
+}
+
 func (discoveryCache *discoveryCache) get(key string) (*discoveryData, error) {
 	discoveryCache.lock.RLock()
 	defer discoveryCache.lock.RUnlock()
