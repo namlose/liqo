@@ -1,4 +1,4 @@
-name: Merge the current PR
+name: Add the ok-to-test label
 on:
   repository_dispatch:
     types:
