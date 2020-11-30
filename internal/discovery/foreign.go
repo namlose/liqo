@@ -112,6 +112,7 @@ func (discovery *DiscoveryCtrl) createForeign(data *discoveryData, sd *v1alpha1.
 			Namespace:     data.TxtData.Namespace,
 			ApiUrl:        data.TxtData.ApiUrl,
 			DiscoveryType: discoveryType,
+			AuthUrl:       data.AuthData.GetUrl(),
 		},
 	}
 	fc.LastUpdateNow()

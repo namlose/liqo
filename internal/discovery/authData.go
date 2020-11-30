@@ -26,6 +26,10 @@ func (authData *AuthData) IsComplete() bool {
 	return authData.address != "" && authData.port > 0
 }
 
+func (authData *AuthData) GetUrl() string {
+	return fmt.Sprintf("https://%v:%v", authData.address, authData.port)
+}
+
 func (authData *AuthData) Decode(entry *zeroconf.ServiceEntry, timeout time.Duration) error {
 	authData.port = entry.Port
 
